@@ -1,0 +1,13 @@
+name = "email-forwarder"
+main = "worker.ts"
+compatibility_date = "2025-11-16"
+
+[vars]
+FORWARD_FROM_NAME = "Smart Forwarder"
+
+[[kv_namespaces]]
+binding = "FORWARD_RULES"
+id = "replace-with-your-kv-id"
+
+[triggers]
+email = []
