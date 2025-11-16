@@ -1,0 +1,14 @@
+[
+  {
+    "pattern": "*@company.com",
+    "target": "team@external.com"
+  },
+  {
+    "pattern": "sales+*",
+    "target": "sales@backup.com"
+  },
+  {
+    "pattern": "admin@*.org",
+    "target": "admin@central.org"
+  }
+]
