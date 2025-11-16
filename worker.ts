@@ -1,32 +1,9 @@
-// worker.ts - Cloudflare Email Worker for Multi-Domain Smart Forwarding
-
-export interface Env {
-  FORWARD_RULES: KVNamespace;
-  RESEND_API_KEY: string;
-  DEFAULT_FORWARD_EMAIL: string;
-  FORWARD_FROM_NAME?: string;
-}
-
-interface EmailMessage {
-  from: string;
-  to: string;
-  cc?: string | null;
-  bcc?: string | null;
-  raw: ReadableStream;
-  headers: Headers;
-  setReject(reason: string): void;
-  forward(to: string): Promise<void>;
-}
-
-interface Rule {
-  pattern: string;
-  target: string;
-  compiled: RegExp;
-}
+// worker.js - Cloudflare Email Worker (Pure JavaScript)
 
 export default {
-  async email(message: EmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
-    const recipients = new Set<string>();
+  async email(message, env, ctx) {
+    // Parse all recipient addresses (to, cc, bcc)
+    const recipients = new Set();
     [message.to, message.cc, message.bcc].forEach(addr => {
       if (addr) {
         addr.split(',').map(a => a.trim().toLowerCase()).forEach(a => {
@@ -35,89 +12,94 @@ export default {
       }
     });
 
+    // Load rules from KV
     const rulesJson = await env.FORWARD_RULES.get('rules');
     if (!rulesJson) {
-      await forwardTo(message, env.DEFAULT_FORWARD_EMAIL, env, 'Default Forward');
+      await forwardToDefault(message, env);
       return;
     }
 
-    let rules: Rule[];
+    let rules;
     try {
-      rules = JSON.parse(rulesJson).map((r: { pattern: string; target: string }) => ({
+      rules = JSON.parse(rulesJson).map(r => ({
         pattern: r.pattern,
         target: r.target,
-        compiled: wildcardToRegex(r.pattern.toLowerCase())
+        regex: wildcardToRegex(r.pattern.toLowerCase())
       }));
     } catch (e) {
-      await forwardTo(message, env.DEFAULT_FORWARD_EMAIL, env, 'Invalid Rules JSON');
+      await forwardToDefault(message, env);
       return;
     }
 
-    const forwardedTo = new Set<string>();
+    const forwardedTo = new Set();
 
+    // Match rules
     for (const addr of recipients) {
       for (const rule of rules) {
-        if (rule.compiled.test(addr) && !forwardedTo.has(rule.target)) {
+        if (rule.regex.test(addr) && !forwardedTo.has(rule.target)) {
           forwardedTo.add(rule.target);
           const rawCopy = message.raw.pipeThrough(new IdentityTransformStream());
-          await forwardRaw(message, rule.target, env, rawCopy);
+          await forwardWithResend(message, rule.target, env, rawCopy);
         }
       }
     }
 
+    // Default fallback
     if (forwardedTo.size === 0) {
-      await forwardTo(message, env.DEFAULT_FORWARD_EMAIL, env, 'No Matching Rule');
+      await forwardToDefault(message, env);
     }
   }
 };
 
-function wildcardToRegex(pattern: string): RegExp {
+// Convert wildcard to regex
+function wildcardToRegex(pattern) {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/[*]/g, '.*')
-    .replace(/[?]/g, '.');
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
   return new RegExp('^' + escaped + '$');
 }
 
-async function forwardRaw(message: EmailMessage, to: string, env: Env, rawStream: ReadableStream): Promise<void> {
-  const rawBytes = new Uint8Array(await new Response(rawStream).arrayBuffer());
-  const rawBase64 = btoa(String.fromCharCode(...rawBytes));
+// Forward using Resend API (preserves original email as .eml)
+async function forwardWithResend(message, to, env, rawStream) {
+  try {
+    const rawBytes = new Uint8Array(await new Response(rawStream).arrayBuffer());
+    const rawBase64 = btoa(String.fromCharCode(...rawBytes));
 
-  const fromName = env.FORWARD_FROM_NAME || 'Forwarded Message';
-  const subject = `FWD: ${message.headers.get('subject') || '(no subject)'}`;
+    const fromName = env.FORWARD_FROM_NAME || 'Forwarded Message';
+    const subject = message.headers.get('subject') || '(no subject)';
+    const fwdSubject = `FWD: ${subject}`;
 
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: `${fromName} <noreply@forward.yourdomain.com>`,
-      to: [to],
-      subject: subject,
-      reply_to: message.from,
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
       headers: {
-        'X-Original-From': message.from,
-        'X-Original-To': message.to,
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-      attachments: [
-        {
+      body: JSON.stringify({
+        from: `${fromName} <noreply@forward.yourdomain.com>`,
+        to: [to],
+        subject: fwdSubject,
+        reply_to: message.from,
+        headers: {
+          'X-Original-From': message.from,
+          'X-Original-To': message.to,
+        },
+        text: `Forwarded message from ${message.from}\n\nFull email attached as original.eml`,
+        attachments: [{
           filename: 'original.eml',
           content: rawBase64,
           content_type: 'message/rfc822'
-        }
-      ],
-      text: `Forwarded message attached as .eml\nOriginal sender: ${message.from}`
-    })
-  });
+        }]
+      })
+    });
 
-  if (!res.ok) console.error('Resend error:', await res.text());
+    if (!res.ok) {
+      console.error('Resend API error:', await res.text());
+    }
+  } catch (err) {
+    console.error('Forward failed:', err);
+  }
 }
 
-async function forwardTo(message: EmailMessage, to: string, env: Env, reason: string): Promise<void> {
-  const headers = new Headers(message.headers);
-  headers.set('X-Forward-Reason', reason);
-  const modified = new EmailMessage(message.from, to, headers, message.raw);
-  await modified.forward(to);
-}
+// Fallback: use built
